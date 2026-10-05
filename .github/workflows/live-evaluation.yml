@@ -109,27 +109,155 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
 
-          foreach ($name in @("AZURE_CLIENT_ID", "AZURE_TENANT_ID")) {
+          foreach ($name in @(
+            "AZURE_CLIENT_ID",
+            "AZURE_TENANT_ID",
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+          )) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-              throw "The live-evaluation environment secret $name is required."
+              throw "The required environment variable $name is not available."
             }
           }
 
-          $authOutput = Join-Path $env:RUNNER_TEMP "azd-auth-output.txt"
+          function Protect-AuthDiagnostic {
+            param(
+              [AllowEmptyString()]
+              [string] $Text
+            )
+
+            $sanitized = $Text
+            foreach ($secret in @(
+              $env:AZURE_CLIENT_ID,
+              $env:AZURE_TENANT_ID,
+              $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            )) {
+              if (-not [string]::IsNullOrEmpty($secret)) {
+                $sanitized = $sanitized.Replace($secret, "[REDACTED]")
+              }
+            }
+
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?<![A-Za-z0-9_-])(?:[A-Za-z0-9_-]{8,}\.){2}[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])",
+              "[REDACTED_JWT]"
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)\b(https?://[^\s?`"'<>]+)\?[^\s`"'<>]*",
+              '$1?[REDACTED_QUERY]'
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "`e\[[0-?]*[ -/]*[@-~]",
+              ""
+            )
+
+            return $sanitized.Trim()
+          }
+
+          function ConvertFrom-Base64Url {
+            param(
+              [Parameter(Mandatory)]
+              [string] $Value
+            )
+
+            $base64 = $Value.Replace("-", "+").Replace("_", "/")
+            switch ($base64.Length % 4) {
+              0 { }
+              2 { $base64 += "==" }
+              3 { $base64 += "=" }
+              default { throw "The GitHub OIDC token payload is not valid base64url." }
+            }
+
+            return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
+          }
+
+          $oidcAudience = "api://AzureADTokenExchange"
+          $separator = if ($env:ACTIONS_ID_TOKEN_REQUEST_URL.Contains("?")) { "&" } else { "?" }
+          $oidcRequestUri = (
+            $env:ACTIONS_ID_TOKEN_REQUEST_URL +
+            $separator +
+            "audience=" +
+            [Uri]::EscapeDataString($oidcAudience)
+          )
+
           try {
-            azd auth login `
+            $oidcResponse = Invoke-RestMethod `
+              -Method Get `
+              -Uri $oidcRequestUri `
+              -Headers @{
+                Authorization = "Bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+              }
+            $oidcToken = [string] $oidcResponse.value
+            $tokenSegments = $oidcToken.Split(".")
+            if ($tokenSegments.Count -ne 3) {
+              throw "The GitHub OIDC endpoint did not return a JWT."
+            }
+
+            try {
+              $oidcPayload = ConvertFrom-Base64Url $tokenSegments[1] | ConvertFrom-Json
+            } catch {
+              throw "The GitHub OIDC token payload could not be decoded."
+            }
+
+            foreach ($claim in @("iss", "aud", "sub")) {
+              if ($null -eq $oidcPayload.PSObject.Properties[$claim]) {
+                throw "The GitHub OIDC token is missing the $claim claim."
+              }
+            }
+
+            $oidcClaims = [ordered] @{
+              iss = $oidcPayload.iss
+              aud = $oidcPayload.aud
+              sub = $oidcPayload.sub
+            }
+            Write-Host "GitHub OIDC claims: $($oidcClaims | ConvertTo-Json -Compress -Depth 3)"
+          } catch {
+            $diagnostic = Protect-AuthDiagnostic ($_ | Out-String)
+            if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+              $diagnostic = "Failed to request and decode the GitHub OIDC token."
+            }
+            [Console]::Error.WriteLine($diagnostic)
+            exit 1
+          } finally {
+            $oidcResponse = $null
+            $oidcToken = $null
+            $tokenSegments = $null
+            $oidcPayload = $null
+          }
+
+          $authOutput = Join-Path $env:RUNNER_TEMP "azd-auth-output.txt"
+          $authExitCode = 0
+          $authDiagnostic = $null
+          try {
+            & azd auth login `
               --client-id $env:AZURE_CLIENT_ID `
               --tenant-id $env:AZURE_TENANT_ID `
               --federated-credential-provider github `
               --no-prompt `
-              1> $authOutput
-            if ($LASTEXITCODE -ne 0) {
-              throw "GitHub OIDC authentication failed."
+              *> $authOutput
+            $authExitCode = $LASTEXITCODE
+            if ($authExitCode -ne 0) {
+              $authDiagnostic = Protect-AuthDiagnostic (
+                Get-Content -LiteralPath $authOutput -Raw -ErrorAction SilentlyContinue
+              )
+              if ([string]::IsNullOrWhiteSpace($authDiagnostic)) {
+                $authDiagnostic = "azd auth login failed without diagnostic output."
+              }
             }
           } finally {
             Remove-Item -LiteralPath $authOutput -Force -ErrorAction SilentlyContinue
           }
+
+          if ($authExitCode -ne 0) {
+            [Console]::Error.WriteLine($authDiagnostic)
+            exit $authExitCode
+          }
+
+          Write-Host "Azure authentication with GitHub OIDC succeeded."
 
       - name: Create and run the live evaluation
         shell: pwsh
