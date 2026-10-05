@@ -38,7 +38,7 @@ secrets:
 - `AZURE_TENANT_ID`
 - `AZURE_AI_PROJECT_ENDPOINT`
 
-The federated identity needs the **Azure AI User** role at the Foundry project
+The federated identity needs the **Foundry User** role at the Foundry project
 scope. The workflow uses no client secret and the `builtin.f1_score` evaluator
 requires no model deployment.
 
