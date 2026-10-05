@@ -1,0 +1,2 @@
+{"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"2 + 2 is 4."}]}
+{"messages":[{"role":"user","content":"Please add two and two."},{"role":"assistant","content":"The result is 4."}]}

@@ -1,0 +1,274 @@
+name: Live azd evaluation quality gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  live-evaluation:
+    name: Run live F1 quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: live-evaluation
+    env:
+      AZURE_DEV_COLLECT_TELEMETRY: "no"
+      NO_COLOR: "1"
+      AZD_REGISTRY_URL: https://github.com/m7md7sien/azd-foundry-feed/releases/download/extensions-2026-10-05-47/registry.json
+      AZD_EVALUATIONS_VERSION: 1.0.47-beta
+      AZD_DATASET_VERSION: 1.0.0-beta.35
+
+    steps:
+      - name: Check out the live fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up azd 1.34.1
+        uses: Azure/setup-azd@0b7e3a35ab00f2eee7080c845eb39c3f0ebfa553 # v2.4.0
+        with:
+          version: 1.34.1
+
+      - name: Install and verify the pinned extensions
+        shell: pwsh
+        env:
+          AZD_CONFIG_DIR: ${{ runner.temp }}/azd-config
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          azd extension source add `
+            --name build-47 `
+            --type url `
+            --location $env:AZD_REGISTRY_URL `
+            --no-prompt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to register the Build 47 extension source."
+          }
+
+          azd extension install azure.ai.evaluations `
+            --version $env:AZD_EVALUATIONS_VERSION `
+            --source build-47 `
+            --no-prompt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install azure.ai.evaluations."
+          }
+
+          azd extension install azure.ai.dataset `
+            --version $env:AZD_DATASET_VERSION `
+            --source build-47 `
+            --no-prompt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install azure.ai.dataset."
+          }
+
+          $installedJson = azd extension list --installed --output json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to list installed extensions."
+          }
+
+          try {
+            $installed = @(($installedJson -join [Environment]::NewLine) | ConvertFrom-Json)
+          } catch {
+            throw "azd extension list did not return valid JSON: $($_.Exception.Message)"
+          }
+
+          $expected = @{
+            "azure.ai.evaluations" = $env:AZD_EVALUATIONS_VERSION
+            "azure.ai.dataset" = $env:AZD_DATASET_VERSION
+          }
+          $actual = @{}
+
+          foreach ($extension in $installed) {
+            if ($actual.ContainsKey($extension.id)) {
+              throw "Duplicate installed extension entry: $($extension.id)"
+            }
+            $actual[$extension.id] = $extension.installedVersion
+          }
+
+          if ($actual.Count -ne $expected.Count) {
+            throw "Expected exactly $($expected.Count) installed extensions, found $($actual.Count)."
+          }
+
+          foreach ($extensionId in $expected.Keys) {
+            if (-not $actual.ContainsKey($extensionId)) {
+              throw "Required extension is not installed: $extensionId"
+            }
+            if ($actual[$extensionId] -cne $expected[$extensionId]) {
+              throw "Unexpected $extensionId version: expected $($expected[$extensionId]), found $($actual[$extensionId])."
+            }
+          }
+
+      - name: Authenticate to Azure with GitHub OIDC
+        shell: pwsh
+        env:
+          AZD_CONFIG_DIR: ${{ runner.temp }}/azd-config
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          foreach ($name in @("AZURE_CLIENT_ID", "AZURE_TENANT_ID")) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "The live-evaluation environment secret $name is required."
+            }
+          }
+
+          $authOutput = Join-Path $env:RUNNER_TEMP "azd-auth-output.txt"
+          try {
+            azd auth login `
+              --client-id $env:AZURE_CLIENT_ID `
+              --tenant-id $env:AZURE_TENANT_ID `
+              --federated-credential-provider github `
+              --no-prompt `
+              1> $authOutput
+            if ($LASTEXITCODE -ne 0) {
+              throw "GitHub OIDC authentication failed."
+            }
+          } finally {
+            Remove-Item -LiteralPath $authOutput -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Create and run the live evaluation
+        shell: pwsh
+        env:
+          AZD_CONFIG_DIR: ${{ runner.temp }}/azd-config
+          AZURE_AI_PROJECT_ENDPOINT: ${{ secrets.AZURE_AI_PROJECT_ENDPOINT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:AZURE_AI_PROJECT_ENDPOINT)) {
+            throw "The live-evaluation environment secret AZURE_AI_PROJECT_ENDPOINT is required."
+          }
+
+          $createOutput = Join-Path $env:RUNNER_TEMP "azd-eval-create-output.txt"
+          $rawResult = Join-Path $env:RUNNER_TEMP "azd-eval-run.json"
+          $summaryDirectory = Join-Path $env:RUNNER_TEMP "live-evaluation-summary"
+          $summaryPath = Join-Path $summaryDirectory "summary.json"
+
+          if (Test-Path -LiteralPath $summaryDirectory) {
+            Remove-Item -LiteralPath $summaryDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $summaryDirectory -Force | Out-Null
+
+          try {
+            azd ai eval create ci-f1-quality `
+              --from-file live/azure.eval.yaml `
+              --project-endpoint $env:AZURE_AI_PROJECT_ENDPOINT `
+              --no-prompt `
+              1> $createOutput
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create the live evaluation."
+            }
+
+            azd ai eval run start `
+              --eval ci-f1-quality `
+              --path live `
+              --project-endpoint $env:AZURE_AI_PROJECT_ENDPOINT `
+              --wait `
+              --fail-on 'pass-rate=1' `
+              --output json `
+              --no-prompt `
+              1> $rawResult
+            if ($LASTEXITCODE -ne 0) {
+              throw "The live evaluation did not satisfy the pass-rate gate."
+            }
+
+            try {
+              $run = Get-Content -LiteralPath $rawResult -Raw | ConvertFrom-Json
+            } catch {
+              throw "The live evaluation did not return valid JSON: $($_.Exception.Message)"
+            }
+
+            if ($null -eq $run.PSObject.Properties["status"]) {
+              throw "The live evaluation result did not report status."
+            }
+            $status = [string] $run.status
+            if ($status -cne "completed") {
+              throw "Expected live evaluation status completed, found $status."
+            }
+
+            if ($null -eq $run.PSObject.Properties["result_counts"] -or $null -eq $run.result_counts) {
+              throw "The live evaluation result did not report result_counts."
+            }
+
+            function Get-RequiredCount {
+              param(
+                [object] $Counts,
+                [string] $Name
+              )
+
+              $property = $Counts.PSObject.Properties[$Name]
+              if ($null -eq $property -or $null -eq $property.Value) {
+                throw "The live evaluation result did not report result_counts.$Name."
+              }
+
+              $parsed = 0L
+              $text = [Convert]::ToString($property.Value, [Globalization.CultureInfo]::InvariantCulture)
+              if (
+                -not [long]::TryParse(
+                  $text,
+                  [Globalization.NumberStyles]::None,
+                  [Globalization.CultureInfo]::InvariantCulture,
+                  [ref] $parsed
+                ) -or
+                $parsed -lt 0
+              ) {
+                throw "The live evaluation result reported a non-integer result_counts.$Name."
+              }
+              return $parsed
+            }
+
+            $passed = Get-RequiredCount $run.result_counts "passed"
+            $failed = Get-RequiredCount $run.result_counts "failed"
+            $errored = Get-RequiredCount $run.result_counts "errored"
+
+            if ($passed -ne 2 -or $failed -ne 0 -or $errored -ne 0) {
+              throw "Expected passed=2, failed=0, errored=0; found passed=$passed, failed=$failed, errored=$errored."
+            }
+
+            $sanitized = [ordered] @{
+              status = $status
+              counts = [ordered] @{
+                passed = $passed
+                failed = $failed
+                errored = $errored
+              }
+              evaluator = "builtin.f1_score"
+            }
+            $sanitizedJson = $sanitized | ConvertTo-Json -Depth 3
+
+            if ($sanitizedJson.Contains($env:AZURE_AI_PROJECT_ENDPOINT, [StringComparison]::Ordinal)) {
+              throw "The sanitized summary contains the project endpoint."
+            }
+
+            $sanitizedJson | Set-Content -LiteralPath $summaryPath -Encoding utf8NoBOM
+
+            $stepSummary = @(
+              "## Live evaluation quality gate"
+              ""
+              "| Result | Value |"
+              "|---|---:|"
+              "| Status | $status |"
+              "| Passed | $passed |"
+              "| Failed | $failed |"
+              "| Errored | $errored |"
+              '| Evaluator | `builtin.f1_score` (threshold 0.9) |'
+              ""
+              "**Pinned packages:** azd 1.34.1; azure.ai.evaluations $env:AZD_EVALUATIONS_VERSION; azure.ai.dataset $env:AZD_DATASET_VERSION."
+            )
+            $stepSummary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          } finally {
+            Remove-Item -LiteralPath $createOutput -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $rawResult -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload the sanitized live summary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-evaluation-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-evaluation-summary/summary.json
+          if-no-files-found: error
+          retention-days: 7

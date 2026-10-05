@@ -1,0 +1,212 @@
+name: azd evaluation extension example
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scaffold:
+    name: Scaffold evaluation / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2025
+    env:
+      AZURE_DEV_COLLECT_TELEMETRY: "no"
+      NO_COLOR: "1"
+      AZD_REGISTRY_URL: https://github.com/m7md7sien/azd-foundry-feed/releases/download/extensions-2026-10-05-47/registry.json
+      AZD_EVALUATIONS_VERSION: 1.0.47-beta
+      AZD_DATASET_VERSION: 1.0.0-beta.35
+
+    steps:
+      - name: Check out the fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up azd 1.34.1
+        uses: Azure/setup-azd@0b7e3a35ab00f2eee7080c845eb39c3f0ebfa553 # v2.4.0
+        with:
+          version: 1.34.1
+
+      - name: Install and verify the pinned extensions
+        shell: pwsh
+        env:
+          AZD_CONFIG_DIR: ${{ runner.temp }}/azd-config
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          azd extension source add `
+            --name build-47 `
+            --type url `
+            --location $env:AZD_REGISTRY_URL `
+            --no-prompt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to register the Build 47 extension source."
+          }
+
+          azd extension install azure.ai.evaluations `
+            --version $env:AZD_EVALUATIONS_VERSION `
+            --source build-47 `
+            --no-prompt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install azure.ai.evaluations."
+          }
+
+          azd extension install azure.ai.dataset `
+            --version $env:AZD_DATASET_VERSION `
+            --source build-47 `
+            --no-prompt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install azure.ai.dataset."
+          }
+
+          $installedJson = azd extension list --installed --output json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to list installed extensions."
+          }
+
+          try {
+            $installed = @(($installedJson -join [Environment]::NewLine) | ConvertFrom-Json)
+          } catch {
+            throw "azd extension list did not return valid JSON: $($_.Exception.Message)"
+          }
+
+          $expected = @{
+            "azure.ai.evaluations" = $env:AZD_EVALUATIONS_VERSION
+            "azure.ai.dataset" = $env:AZD_DATASET_VERSION
+          }
+          $actual = @{}
+
+          foreach ($extension in $installed) {
+            if ($actual.ContainsKey($extension.id)) {
+              throw "Duplicate installed extension entry: $($extension.id)"
+            }
+            $actual[$extension.id] = $extension.installedVersion
+          }
+
+          if ($actual.Count -ne $expected.Count) {
+            throw "Expected exactly $($expected.Count) installed extensions, found $($actual.Count)."
+          }
+
+          foreach ($extensionId in $expected.Keys) {
+            if (-not $actual.ContainsKey($extensionId)) {
+              throw "Required extension is not installed: $extensionId"
+            }
+            if ($actual[$extensionId] -cne $expected[$extensionId]) {
+              throw "Unexpected $extensionId version: expected $($expected[$extensionId]), found $($actual[$extensionId])."
+            }
+          }
+
+      - name: Scaffold and validate the disposable project
+        shell: pwsh
+        env:
+          AZD_CONFIG_DIR: ${{ runner.temp }}/azd-config
+        run: |
+          $ErrorActionPreference = "Stop"
+          $project = Join-Path $env:RUNNER_TEMP "azd-eval-project"
+          $artifact = Join-Path $env:RUNNER_TEMP "azd-eval-generated"
+          $fixture = Join-Path $env:GITHUB_WORKSPACE "sample"
+
+          if (Test-Path -LiteralPath $project) {
+            Remove-Item -LiteralPath $project -Recurse -Force
+          }
+          if (Test-Path -LiteralPath $artifact) {
+            Remove-Item -LiteralPath $artifact -Recurse -Force
+          }
+
+          Copy-Item -LiteralPath $fixture -Destination $project -Recurse
+
+          Push-Location $project
+          try {
+            azd ai eval init `
+              --conversation-mode static `
+              --dataset data/completed-conversations.jsonl `
+              --evaluation-level conversation `
+              --evaluator builtin.coherence `
+              --judge-model ci-placeholder-model `
+              --name ci-conversation-quality `
+              --path evals `
+              --no-prompt
+            if ($LASTEXITCODE -ne 0) {
+              throw "azd ai eval init failed."
+            }
+          } finally {
+            Pop-Location
+          }
+
+          $evalPath = Join-Path $project "evals/azure.eval.yaml"
+          $azurePath = Join-Path $project "azure.yaml"
+          if (-not (Test-Path -LiteralPath $evalPath -PathType Leaf)) {
+            throw "azd ai eval init did not create evals/azure.eval.yaml."
+          }
+          if (-not (Test-Path -LiteralPath $azurePath -PathType Leaf)) {
+            throw "The disposable project does not contain azure.yaml."
+          }
+
+          $evalConfig = Get-Content -LiteralPath $evalPath -Raw
+          $azureConfig = Get-Content -LiteralPath $azurePath -Raw
+
+          function Assert-ConfigPattern {
+            param(
+              [string] $Content,
+              [string] $Pattern,
+              [string] $Description
+            )
+
+            if ($Content -cnotmatch $Pattern) {
+              throw "Generated configuration is missing $Description."
+            }
+          }
+
+          Assert-ConfigPattern $evalConfig '(?m)^\s*-\s+name:\s+completed-conversations\s*$' "the completed-conversations dataset"
+          Assert-ConfigPattern $evalConfig '(?m)^\s*file:\s+\.\./data/completed-conversations\.jsonl\s*$' "the fixture dataset path"
+          Assert-ConfigPattern $evalConfig '(?m)^\s*-\s+name:\s+ci-conversation-quality\s*$' "the evaluation name"
+          Assert-ConfigPattern $evalConfig '(?m)^\s*dataset:\s+completed-conversations\s*$' "the evaluation dataset reference"
+          Assert-ConfigPattern $evalConfig '(?m)^\s*evaluation_level:\s+conversation\s*$' "conversation-level evaluation"
+          Assert-ConfigPattern $evalConfig '(?m)^\s*-\s+evaluator:\s+builtin\.coherence\s*$' "the coherence evaluator"
+          Assert-ConfigPattern $evalConfig '(?m)^\s*model:\s+ci-placeholder-model\s*$' "the judge model placeholder"
+          Assert-ConfigPattern $azureConfig '(?m)^\s*conversation-evals:\s*$' "the evaluation service"
+          Assert-ConfigPattern $azureConfig '(?m)^\s*host:\s+azure\.ai\.eval\s*$' "the evaluation service host"
+          Assert-ConfigPattern $azureConfig '(?m)^\s*\$ref:\s+\./evals/azure\.eval\.yaml\s*$' "the evaluation service reference"
+
+          New-Item -ItemType Directory -Path (Join-Path $artifact "data") -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $artifact "evals") -Force | Out-Null
+          Copy-Item -LiteralPath $azurePath -Destination (Join-Path $artifact "azure.yaml")
+          Copy-Item `
+            -LiteralPath (Join-Path $project "data/completed-conversations.jsonl") `
+            -Destination (Join-Path $artifact "data/completed-conversations.jsonl")
+          Copy-Item `
+            -LiteralPath $evalPath `
+            -Destination (Join-Path $artifact "evals/azure.eval.yaml")
+
+          $artifactFiles = @(
+            Get-ChildItem -LiteralPath $artifact -File -Recurse |
+              ForEach-Object { [IO.Path]::GetRelativePath($artifact, $_.FullName) }
+          )
+          $expectedArtifactFiles = @(
+            "azure.yaml"
+            [IO.Path]::Combine("data", "completed-conversations.jsonl")
+            [IO.Path]::Combine("evals", "azure.eval.yaml")
+          )
+          if (@(Compare-Object $expectedArtifactFiles $artifactFiles).Count -ne 0) {
+            throw "The sanitized artifact contains an unexpected file set: $($artifactFiles -join ', ')"
+          }
+
+      - name: Upload the sanitized generated project
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: azd-eval-generated-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/azd-eval-generated/
+          if-no-files-found: error
+          retention-days: 7
