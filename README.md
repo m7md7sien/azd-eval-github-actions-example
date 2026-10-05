@@ -18,6 +18,9 @@ A successful job proves that the pinned extension packages install and that
 their offline scaffold command produces the expected dataset, evaluation, and
 `azure.yaml` service configuration on both runner operating systems.
 
+The successful [main offline workflow run][offline-run] passed on both Ubuntu
+and Windows.
+
 It **does not** authenticate to Azure, register a dataset, contact a project
 endpoint, create or run an evaluation, or prove that a live evaluation
 succeeds.
@@ -43,8 +46,15 @@ scope. The workflow uses no client secret and the `builtin.f1_score` evaluator
 requires no model deployment.
 
 The exact create/run lifecycle was validated locally against a disposable
-Foundry project. A successful GitHub Actions live run is not claimed yet; the
-repository run remains pending.
+Foundry project with 2 passed, 0 failed, and 0 errored. A live GitHub Actions
+success is not claimed: this personal repository cannot complete OIDC against
+Microsoft's tenant because its GitHub token has an empty `enterprise` claim.
+Tenant policy returns `AADSTS7002381` and requires `enterprise` to be
+`microsoft`, `github`, or `microsoftopensource`.
+
+The default-off workflow remains a valid reusable template when hosted by an
+enterprise-backed GitHub organization whose token has an accepted
+`enterprise` claim, or when targeting a tenant without that policy.
 
 The broader [Azure/azure-dev#10178 release harness][release-harness] has
 different release-validation goals and is intentionally not reproduced here.
@@ -62,4 +72,5 @@ version, and every GitHub Action to a full commit SHA. To test a later build:
 Do not replace the registry URL with a moving `latest` URL.
 
 [build-47]: https://github.com/m7md7sien/azd-foundry-feed/releases/tag/extensions-2026-10-05-47
+[offline-run]: https://github.com/m7md7sien/azd-eval-github-actions-example/actions/runs/37356577007
 [release-harness]: https://github.com/Azure/azure-dev/pull/10178
