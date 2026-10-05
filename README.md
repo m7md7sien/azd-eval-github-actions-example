@@ -1,8 +1,11 @@
 # azd evaluation extension GitHub Actions example
 
 This repository is a small public-consumer example for the prerelease `azd`
-evaluation extensions. The default workflow runs on Ubuntu and Windows without
-Azure credentials:
+evaluation extensions.
+
+## Offline install and scaffold
+
+The default workflow runs on Ubuntu and Windows without Azure credentials:
 
 1. installs `azd` 1.34.1;
 2. registers the immutable [Build 47 extension registry][build-47];
@@ -15,11 +18,36 @@ A successful job proves that the pinned extension packages install and that
 their offline scaffold command produces the expected dataset, evaluation, and
 `azure.yaml` service configuration on both runner operating systems.
 
-It **does not** authenticate to Azure, register a dataset, contact a project or
-model endpoint, create or run an evaluation, or prove that a live evaluation
-succeeds. The broader [Azure/azure-dev#10178 release harness][release-harness]
-has different release-validation goals and is intentionally not reproduced
-here.
+It **does not** authenticate to Azure, register a dataset, contact a project
+endpoint, create or run an evaluation, or prove that a live evaluation
+succeeds.
+
+## Default-off live quality gate
+
+The manually dispatched
+[`live-evaluation.yml`](.github/workflows/live-evaluation.yml) workflow is a
+real Foundry quality gate. It authenticates with GitHub OIDC, publishes the
+two-row `live/` dataset and F1 evaluation, waits for the run, requires a
+100-percent pass rate, verifies `passed=2`, `failed=0`, and `errored=0`, and
+uploads only a sanitized count summary.
+
+Configure the `live-evaluation` GitHub environment with these environment
+secrets:
+
+- `AZURE_CLIENT_ID`
+- `AZURE_TENANT_ID`
+- `AZURE_AI_PROJECT_ENDPOINT`
+
+The federated identity needs the **Azure AI User** role at the Foundry project
+scope. The workflow uses no client secret and the `builtin.f1_score` evaluator
+requires no model deployment.
+
+The exact create/run lifecycle was validated locally against a disposable
+Foundry project. A successful GitHub Actions live run is not claimed yet; the
+repository run remains pending.
+
+The broader [Azure/azure-dev#10178 release harness][release-harness] has
+different release-validation goals and is intentionally not reproduced here.
 
 ## Immutable pins
 
@@ -32,22 +60,6 @@ version, and every GitHub Action to a full commit SHA. To test a later build:
 4. update action SHAs only after reviewing the corresponding upstream release.
 
 Do not replace the registry URL with a moving `latest` URL.
-
-## Live evaluation follow-up
-
-A live OIDC workflow is intentionally omitted because the complete live
-resource/configuration contract could not be established from the available
-prerelease CLI help and source without inventing steps. Once that contract is
-published and validated, add a separate, default-off `workflow_dispatch`
-workflow that:
-
-- grants only `contents: read` and `id-token: write`;
-- reads Azure identifiers and resource settings from GitHub environment
-  variables or secrets;
-- authenticates without a client secret by running
-  `azd auth login --federated-credential-provider github`; and
-- executes and verifies the documented create/run/results lifecycle with
-  bounded cleanup.
 
 [build-47]: https://github.com/m7md7sien/azd-foundry-feed/releases/tag/extensions-2026-10-05-47
 [release-harness]: https://github.com/Azure/azure-dev/pull/10178
