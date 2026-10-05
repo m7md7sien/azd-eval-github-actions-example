@@ -1,6 +1,7 @@
 name: Live azd evaluation quality gate
 
 on:
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -10,6 +11,11 @@ permissions:
 jobs:
   live-evaluation:
     name: Run live F1 quality gate
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      vars.AZD_EVAL_LIVE_PR_GATE == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment:
@@ -259,55 +265,178 @@ jobs:
 
           Write-Host "Azure authentication with GitHub OIDC succeeded."
 
-      - name: Create and run the live evaluation
+      - name: Run Scenario 5 evaluation lifecycle
         shell: pwsh
         env:
           AZD_CONFIG_DIR: ${{ runner.temp }}/azd-config
           AZURE_AI_PROJECT_ENDPOINT: ${{ secrets.AZURE_AI_PROJECT_ENDPOINT }}
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
 
           if ([string]::IsNullOrWhiteSpace($env:AZURE_AI_PROJECT_ENDPOINT)) {
             throw "The live-evaluation environment secret AZURE_AI_PROJECT_ENDPOINT is required."
           }
 
-          $createOutput = Join-Path $env:RUNNER_TEMP "azd-eval-create-output.txt"
-          $rawResult = Join-Path $env:RUNNER_TEMP "azd-eval-run.json"
-          $summaryDirectory = Join-Path $env:RUNNER_TEMP "live-evaluation-summary"
-          $summaryPath = Join-Path $summaryDirectory "summary.json"
+          function Protect-LiveDiagnostic {
+            param(
+              [AllowEmptyString()]
+              [string] $Text
+            )
 
-          if (Test-Path -LiteralPath $summaryDirectory) {
-            Remove-Item -LiteralPath $summaryDirectory -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $summaryDirectory -Force | Out-Null
-
-          try {
-            azd ai eval create ci-f1-quality `
-              --from-file live/azure.eval.yaml `
-              --project-endpoint $env:AZURE_AI_PROJECT_ENDPOINT `
-              --no-prompt `
-              1> $createOutput
-            if ($LASTEXITCODE -ne 0) {
-              throw "Failed to create the live evaluation."
+            $sanitized = $Text
+            $runIdentifier = if (Test-Path variable:runId) { [string] $runId } else { $null }
+            foreach ($sensitiveValue in @(
+              $env:AZURE_AI_PROJECT_ENDPOINT
+              $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN
+              $runIdentifier
+            )) {
+              if (-not [string]::IsNullOrEmpty($sensitiveValue)) {
+                $sanitized = $sanitized.Replace($sensitiveValue, "[REDACTED]")
+              }
             }
 
-            azd ai eval run start `
-              --eval ci-f1-quality `
-              --path live `
-              --project-endpoint $env:AZURE_AI_PROJECT_ENDPOINT `
-              --wait `
-              --fail-on 'pass-rate=1' `
-              --output json `
-              --no-prompt `
-              1> $rawResult
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)\b(client(?:-|\s)?id|tenant(?:-|\s)?id)\s*[:=]\s*[^\s,;]+",
+              '$1=[REDACTED]'
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)(?<![0-9a-f])" +
+                "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" +
+                "(?![0-9a-f])",
+              "[REDACTED_GUID]"
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?<![A-Za-z0-9_-])(?:[A-Za-z0-9_-]{8,}\.){2}[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])",
+              "[REDACTED_JWT]"
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+",
+              '$1[REDACTED]'
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)\b(https?://[^\s?`"'<>]+)\?[^\s`"'<>]*",
+              '$1?[REDACTED_QUERY]'
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "`e\[[0-?]*[ -/]*[@-~]",
+              ""
+            )
+
+            return $sanitized.Trim()
+          }
+
+          function Write-SanitizedDiagnostic {
+            param(
+              [string[]] $Paths,
+              [string] $Fallback
+            )
+
+            $captured = @(
+              foreach ($path in $Paths) {
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+                }
+              }
+            ) -join [Environment]::NewLine
+            $diagnostic = Protect-LiveDiagnostic $captured
+            if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+              $diagnostic = $Fallback
+            }
+            [Console]::Error.WriteLine($diagnostic)
+          }
+
+          $deployOutput = Join-Path $env:RUNNER_TEMP "azd-eval-up-output.txt"
+          $startOutput = Join-Path $env:RUNNER_TEMP "azd-eval-run-start.json"
+          $startError = Join-Path $env:RUNNER_TEMP "azd-eval-run-start-error.txt"
+          $showOutput = Join-Path $env:RUNNER_TEMP "azd-eval-run-show.json"
+          $showError = Join-Path $env:RUNNER_TEMP "azd-eval-run-show-error.txt"
+          $rawExport = Join-Path $env:RUNNER_TEMP "azd-eval-run-export.json"
+          $exportOutput = Join-Path $env:RUNNER_TEMP "azd-eval-run-export-output.txt"
+          $evidenceDirectory = Join-Path $env:RUNNER_TEMP "live-evaluation-evidence"
+          $evidencePath = Join-Path $evidenceDirectory "results.json"
+          $fixturePath = Join-Path $env:GITHUB_WORKSPACE "live/data/golden.jsonl"
+          $rawPaths = @(
+            $deployOutput
+            $startOutput
+            $startError
+            $showOutput
+            $showError
+            $rawExport
+            $exportOutput
+          )
+
+          if (Test-Path -LiteralPath $evidenceDirectory) {
+            Remove-Item -LiteralPath $evidenceDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $evidenceDirectory -Force | Out-Null
+
+          try {
+            & azd up --no-prompt *> $deployOutput
             if ($LASTEXITCODE -ne 0) {
-              throw "The live evaluation did not satisfy the pass-rate gate."
+              Write-SanitizedDiagnostic `
+                -Paths @($deployOutput) `
+                -Fallback "azd up failed without diagnostic output."
+              throw "azd up failed to reconcile the checked-in evaluation configuration."
+            }
+
+            & azd ai eval run start `
+              --eval ci-f1-quality `
+              --no-prompt `
+              --no-wait `
+              -o json `
+              1> $startOutput `
+              2> $startError
+            if ($LASTEXITCODE -ne 0) {
+              Write-SanitizedDiagnostic `
+                -Paths @($startError, $startOutput) `
+                -Fallback "Evaluation start failed without diagnostic output."
+              throw "Failed to start the live evaluation."
             }
 
             try {
-              $run = Get-Content -LiteralPath $rawResult -Raw | ConvertFrom-Json
+              $start = Get-Content -LiteralPath $startOutput -Raw | ConvertFrom-Json
             } catch {
-              throw "The live evaluation did not return valid JSON: $($_.Exception.Message)"
+              Write-SanitizedDiagnostic `
+                -Paths @($startError, $startOutput) `
+                -Fallback "Evaluation start returned invalid JSON without diagnostic output."
+              throw "The live evaluation start command did not return valid JSON."
+            }
+
+            $runIdProperty = $start.PSObject.Properties["run_id"]
+            if ($null -eq $runIdProperty -or [string]::IsNullOrWhiteSpace([string] $runIdProperty.Value)) {
+              throw "The live evaluation start command did not report run_id."
+            }
+            $runId = [string] $runIdProperty.Value
+
+            & azd ai eval run show $runId `
+              --eval ci-f1-quality `
+              --wait `
+              --fail-on 'pass-rate=0.8' `
+              --output json `
+              --no-prompt `
+              1> $showOutput `
+              2> $showError
+            if ($LASTEXITCODE -ne 0) {
+              Write-SanitizedDiagnostic `
+                -Paths @($showError, $showOutput) `
+                -Fallback "Evaluation show failed without diagnostic output."
+              throw "The live evaluation did not satisfy the pass-rate=0.8 gate."
+            }
+
+            try {
+              $run = Get-Content -LiteralPath $showOutput -Raw | ConvertFrom-Json
+            } catch {
+              Write-SanitizedDiagnostic `
+                -Paths @($showError, $showOutput) `
+                -Fallback "Evaluation show returned invalid JSON without diagnostic output."
+              throw "The live evaluation show command did not return valid JSON."
             }
 
             if ($null -eq $run.PSObject.Properties["status"]) {
@@ -357,22 +486,221 @@ jobs:
               throw "Expected passed=2, failed=0, errored=0; found passed=$passed, failed=$failed, errored=$errored."
             }
 
+            & azd ai eval run output export $runId `
+              --eval ci-f1-quality `
+              --format json `
+              --output-file $rawExport `
+              --no-prompt `
+              *> $exportOutput
+            if ($LASTEXITCODE -ne 0) {
+              Write-SanitizedDiagnostic `
+                -Paths @($exportOutput) `
+                -Fallback "Evaluation export failed without diagnostic output."
+              throw "Failed to export the live evaluation per-sample results."
+            }
+
+            try {
+              $export = Get-Content -LiteralPath $rawExport -Raw | ConvertFrom-Json
+            } catch {
+              Write-SanitizedDiagnostic `
+                -Paths @($exportOutput) `
+                -Fallback "Evaluation export returned invalid JSON without diagnostic output."
+              throw "The live evaluation export was not valid JSON."
+            }
+
+            $itemsProperty = $export.PSObject.Properties["items"]
+            if ($null -eq $itemsProperty -or $null -eq $itemsProperty.Value) {
+              throw "The live evaluation export did not contain items."
+            }
+            $exportItems = @($itemsProperty.Value)
+
+            $expectedRows = @(
+              [ordered] @{
+                query = "What is the capital of France?"
+                response = "Paris"
+                ground_truth = "Paris"
+              }
+              [ordered] @{
+                query = "What is 2 + 2?"
+                response = "4"
+                ground_truth = "4"
+              }
+            )
+
+            $fixtureRows = @(
+              Get-Content -LiteralPath $fixturePath |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_ | ConvertFrom-Json }
+            )
+            if ($fixtureRows.Count -ne $expectedRows.Count) {
+              throw "The live fixture must contain exactly two allowlisted rows."
+            }
+            for ($index = 0; $index -lt $expectedRows.Count; $index++) {
+              $actualRow = $fixtureRows[$index]
+              $expectedRow = $expectedRows[$index]
+              $actualFields = @($actualRow.PSObject.Properties.Name | Sort-Object)
+              $expectedFields = @("ground_truth", "query", "response")
+              if (@(Compare-Object $expectedFields $actualFields).Count -ne 0) {
+                throw "Live fixture row $($index + 1) contains a non-allowlisted field."
+              }
+              foreach ($field in $expectedFields) {
+                if ([string] $actualRow.$field -cne [string] $expectedRow[$field]) {
+                  throw "Live fixture row $($index + 1) does not match the deterministic allowlist."
+                }
+              }
+            }
+
+            if ($exportItems.Count -ne $expectedRows.Count) {
+              throw "Expected exactly two exported evaluation items, found $($exportItems.Count)."
+            }
+
+            function Get-DescendantPropertyValues {
+              param(
+                [AllowNull()]
+                [object] $Value,
+                [string[]] $Names
+              )
+
+              if ($null -eq $Value -or $Value -is [string] -or $Value.GetType().IsPrimitive) {
+                return
+              }
+              if ($Value -is [Collections.IDictionary]) {
+                foreach ($key in $Value.Keys) {
+                  if ($Names -ccontains [string] $key) {
+                    [pscustomobject] @{ Name = [string] $key; Value = $Value[$key] }
+                  }
+                  Get-DescendantPropertyValues -Value $Value[$key] -Names $Names
+                }
+                return
+              }
+              if ($Value -is [Collections.IEnumerable]) {
+                foreach ($item in $Value) {
+                  Get-DescendantPropertyValues -Value $item -Names $Names
+                }
+                return
+              }
+              foreach ($property in $Value.PSObject.Properties) {
+                if ($Names -ccontains $property.Name) {
+                  [pscustomobject] @{ Name = $property.Name; Value = $property.Value }
+                }
+                Get-DescendantPropertyValues -Value $property.Value -Names $Names
+              }
+            }
+
+            function Test-ContainsExactPropertyValue {
+              param(
+                [object] $Value,
+                [string] $Name,
+                [string] $Expected
+              )
+
+              return @(
+                Get-DescendantPropertyValues -Value $Value -Names @($Name) |
+                  Where-Object { [string] $_.Value -ceq $Expected }
+              ).Count -gt 0
+            }
+
+            $matchedIndexes = [Collections.Generic.HashSet[int]]::new()
+            $samples = @()
+            foreach ($expectedRow in $expectedRows) {
+              $matchingIndexes = @(
+                for ($index = 0; $index -lt $exportItems.Count; $index++) {
+                  $item = $exportItems[$index]
+                  if (
+                    (Test-ContainsExactPropertyValue $item "query" $expectedRow.query) -and
+                    (Test-ContainsExactPropertyValue $item "response" $expectedRow.response) -and
+                    (Test-ContainsExactPropertyValue $item "ground_truth" $expectedRow.ground_truth)
+                  ) {
+                    $index
+                  }
+                }
+              )
+              if ($matchingIndexes.Count -ne 1) {
+                throw "Each allowlisted fixture row must match exactly one exported evaluation item."
+              }
+
+              $matchingIndex = [int] $matchingIndexes[0]
+              if (-not $matchedIndexes.Add($matchingIndex)) {
+                throw "An exported evaluation item matched more than one fixture row."
+              }
+
+              $scores = @(
+                Get-DescendantPropertyValues -Value $exportItems[$matchingIndex] -Names @("score") |
+                  ForEach-Object {
+                    $parsed = 0.0
+                    $text = [Convert]::ToString(
+                      $_.Value,
+                      [Globalization.CultureInfo]::InvariantCulture
+                    )
+                    if (
+                      [double]::TryParse(
+                        $text,
+                        [Globalization.NumberStyles]::Float,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [ref] $parsed
+                      )
+                    ) {
+                      $parsed
+                    }
+                  } |
+                  Sort-Object -Unique
+              )
+              if ($scores.Count -ne 1) {
+                throw "Each exported item must contain one unambiguous evaluator score."
+              }
+              $score = [double] $scores[0]
+              if ($score -lt 0.9) {
+                throw "An exported item did not satisfy the builtin.f1_score threshold."
+              }
+
+              $samples += [ordered] @{
+                query = $expectedRow.query
+                response = $expectedRow.response
+                ground_truth = $expectedRow.ground_truth
+                score = $score
+                passed = $true
+              }
+            }
+
             $sanitized = [ordered] @{
+              schema_version = 1
               status = $status
               counts = [ordered] @{
                 passed = $passed
                 failed = $failed
                 errored = $errored
               }
-              evaluator = "builtin.f1_score"
+              evaluator = [ordered] @{
+                name = "builtin.f1_score"
+                threshold = 0.9
+              }
+              samples = $samples
             }
-            $sanitizedJson = $sanitized | ConvertTo-Json -Depth 3
+            $sanitizedJson = $sanitized | ConvertTo-Json -Depth 6
 
-            if ($sanitizedJson.Contains($env:AZURE_AI_PROJECT_ENDPOINT, [StringComparison]::Ordinal)) {
-              throw "The sanitized summary contains the project endpoint."
+            $forbiddenValues = @(
+              $env:AZURE_AI_PROJECT_ENDPOINT
+              $runId
+              $env:AZURE_CLIENT_ID
+              $env:AZURE_TENANT_ID
+              $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            foreach ($forbiddenValue in $forbiddenValues) {
+              if ($sanitizedJson.Contains($forbiddenValue, [StringComparison]::Ordinal)) {
+                throw "The sanitized evidence contains a forbidden identifier or credential."
+              }
             }
 
-            $sanitizedJson | Set-Content -LiteralPath $summaryPath -Encoding utf8NoBOM
+            $sanitizedJson | Set-Content -LiteralPath $evidencePath -Encoding utf8NoBOM
+
+            $artifactFiles = @(
+              Get-ChildItem -LiteralPath $evidenceDirectory -File -Recurse |
+                ForEach-Object { [IO.Path]::GetRelativePath($evidenceDirectory, $_.FullName) }
+            )
+            $expectedArtifactFiles = @("results.json")
+            if (@(Compare-Object $expectedArtifactFiles $artifactFiles).Count -ne 0) {
+              throw "The sanitized evidence contains an unexpected file set: $($artifactFiles -join ', ')"
+            }
 
             $stepSummary = @(
               "## Live evaluation quality gate"
@@ -384,19 +712,21 @@ jobs:
               "| Failed | $failed |"
               "| Errored | $errored |"
               '| Evaluator | `builtin.f1_score` (threshold 0.9) |'
+              "| Exported samples | $($samples.Count) sanitized rows |"
               ""
               "**Pinned packages:** azd 1.34.1; azure.ai.evaluations $env:AZD_EVALUATIONS_VERSION; azure.ai.dataset $env:AZD_DATASET_VERSION."
             )
             $stepSummary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
           } finally {
-            Remove-Item -LiteralPath $createOutput -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $rawResult -Force -ErrorAction SilentlyContinue
+            foreach ($rawPath in $rawPaths) {
+              Remove-Item -LiteralPath $rawPath -Force -ErrorAction SilentlyContinue
+            }
           }
 
-      - name: Upload the sanitized live summary
+      - name: Upload the sanitized per-sample evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: live-evaluation-summary-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/live-evaluation-summary/summary.json
+          name: live-evaluation-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-evaluation-evidence/results.json
           if-no-files-found: error
           retention-days: 7
