@@ -5,7 +5,16 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError as exc:
+    if exc.name != "yaml":
+        raise
+    print(
+        "PyYAML is required. Run: python -m pip install -r requirements-dev.txt",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 
 ROOT = Path(__file__).resolve().parents[1]

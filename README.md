@@ -86,10 +86,17 @@ enterprise-backed GitHub organization whose token has an accepted
 The broader [Azure/azure-dev#10178 release harness][release-harness] has
 different release-validation goals and is intentionally not reproduced here.
 
-Run `python scripts/validate.py` to parse both workflow files and validate the
-infrastructure-free azd service reference, evaluation schema, deterministic
-fixture, Scenario 5 command order and flags, explicit result assertions,
-artifact allowlist, and raw-output cleanup.
+Install the pinned validation dependency and run the focused checks:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python scripts/validate.py
+```
+
+The validator parses both workflow files and checks the infrastructure-free azd
+service reference, evaluation schema, deterministic fixture, Scenario 5 command
+order and flags, explicit result assertions, artifact allowlist, and raw-output
+cleanup.
 
 ## Immutable pins
 
