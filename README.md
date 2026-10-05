@@ -25,14 +25,20 @@ It **does not** authenticate to Azure, register a dataset, contact a project
 endpoint, create or run an evaluation, or prove that a live evaluation
 succeeds.
 
-## Default-off live quality gate
+## Opt-in live quality gate
 
-The manually dispatched
+The default-off
 [`live-evaluation.yml`](.github/workflows/live-evaluation.yml) workflow is a
 real Foundry quality gate aligned with Scenario 5 (Automation and CI/CD) from
 `coreai-microsoft/foundrysdk_specs#251` at
 `ac6194cfc34dbd4f29a829a586ed66fda6d61b8b`. It authenticates with GitHub
-OIDC and then:
+OIDC when manually dispatched. It can also be enabled as a continuous pull
+request gate by setting the repository variable `AZD_EVAL_LIVE_PR_GATE` to the
+exact value `true`. Pull request runs are allowed only when the head repository
+is this repository; fork pull requests always skip the live job and therefore
+never enter the protected environment or execute OIDC authentication. With the
+variable absent or any value other than `true`, pull request runs remain
+skipped. When enabled, the workflow:
 
 1. reconciles the checked-in `live/azure.eval.yaml` service with
    `azd up --no-prompt`;
@@ -48,10 +54,13 @@ threshold, and for each deterministic fixture row only `query`, `response`,
 `ground_truth`, `score`, and `passed`. The workflow validates the artifact file
 set and rejects the project endpoint, credentials, tokens, and evaluation run
 identifier before upload. Raw deploy, start, show, and export output remains in
-runner-temporary files and is removed in `finally` cleanup.
+runner-temporary files and is removed in `finally` cleanup. Command failures
+emit only sanitized captured diagnostics, including the `--fail-on` quality
+gate message, with endpoint, identity, token, JWT, GUID, and URL-query values
+redacted.
 
 Configure the `live-evaluation` GitHub environment with these environment
-secrets:
+secrets for manual runs and any opted-in same-repository pull request gate:
 
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID`

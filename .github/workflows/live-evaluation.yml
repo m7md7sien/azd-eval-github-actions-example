@@ -1,6 +1,7 @@
 name: Live azd evaluation quality gate
 
 on:
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -10,6 +11,11 @@ permissions:
 jobs:
   live-evaluation:
     name: Run live F1 quality gate
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      vars.AZD_EVAL_LIVE_PR_GATE == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment:
@@ -272,6 +278,80 @@ jobs:
             throw "The live-evaluation environment secret AZURE_AI_PROJECT_ENDPOINT is required."
           }
 
+          function Protect-LiveDiagnostic {
+            param(
+              [AllowEmptyString()]
+              [string] $Text
+            )
+
+            $sanitized = $Text
+            $runIdentifier = if (Test-Path variable:runId) { [string] $runId } else { $null }
+            foreach ($sensitiveValue in @(
+              $env:AZURE_AI_PROJECT_ENDPOINT
+              $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN
+              $runIdentifier
+            )) {
+              if (-not [string]::IsNullOrEmpty($sensitiveValue)) {
+                $sanitized = $sanitized.Replace($sensitiveValue, "[REDACTED]")
+              }
+            }
+
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)\b(client(?:-|\s)?id|tenant(?:-|\s)?id)\s*[:=]\s*[^\s,;]+",
+              '$1=[REDACTED]'
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)(?<![0-9a-f])" +
+                "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" +
+                "(?![0-9a-f])",
+              "[REDACTED_GUID]"
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?<![A-Za-z0-9_-])(?:[A-Za-z0-9_-]{8,}\.){2}[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])",
+              "[REDACTED_JWT]"
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+",
+              '$1[REDACTED]'
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "(?i)\b(https?://[^\s?`"'<>]+)\?[^\s`"'<>]*",
+              '$1?[REDACTED_QUERY]'
+            )
+            $sanitized = [Regex]::Replace(
+              $sanitized,
+              "`e\[[0-?]*[ -/]*[@-~]",
+              ""
+            )
+
+            return $sanitized.Trim()
+          }
+
+          function Write-SanitizedDiagnostic {
+            param(
+              [string[]] $Paths,
+              [string] $Fallback
+            )
+
+            $captured = @(
+              foreach ($path in $Paths) {
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+                }
+              }
+            ) -join [Environment]::NewLine
+            $diagnostic = Protect-LiveDiagnostic $captured
+            if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+              $diagnostic = $Fallback
+            }
+            [Console]::Error.WriteLine($diagnostic)
+          }
+
           $deployOutput = Join-Path $env:RUNNER_TEMP "azd-eval-up-output.txt"
           $startOutput = Join-Path $env:RUNNER_TEMP "azd-eval-run-start.json"
           $startError = Join-Path $env:RUNNER_TEMP "azd-eval-run-start-error.txt"
@@ -300,6 +380,9 @@ jobs:
           try {
             & azd up --no-prompt *> $deployOutput
             if ($LASTEXITCODE -ne 0) {
+              Write-SanitizedDiagnostic `
+                -Paths @($deployOutput) `
+                -Fallback "azd up failed without diagnostic output."
               throw "azd up failed to reconcile the checked-in evaluation configuration."
             }
 
@@ -311,12 +394,18 @@ jobs:
               1> $startOutput `
               2> $startError
             if ($LASTEXITCODE -ne 0) {
+              Write-SanitizedDiagnostic `
+                -Paths @($startError, $startOutput) `
+                -Fallback "Evaluation start failed without diagnostic output."
               throw "Failed to start the live evaluation."
             }
 
             try {
               $start = Get-Content -LiteralPath $startOutput -Raw | ConvertFrom-Json
             } catch {
+              Write-SanitizedDiagnostic `
+                -Paths @($startError, $startOutput) `
+                -Fallback "Evaluation start returned invalid JSON without diagnostic output."
               throw "The live evaluation start command did not return valid JSON."
             }
 
@@ -335,12 +424,18 @@ jobs:
               1> $showOutput `
               2> $showError
             if ($LASTEXITCODE -ne 0) {
+              Write-SanitizedDiagnostic `
+                -Paths @($showError, $showOutput) `
+                -Fallback "Evaluation show failed without diagnostic output."
               throw "The live evaluation did not satisfy the pass-rate=0.8 gate."
             }
 
             try {
               $run = Get-Content -LiteralPath $showOutput -Raw | ConvertFrom-Json
             } catch {
+              Write-SanitizedDiagnostic `
+                -Paths @($showError, $showOutput) `
+                -Fallback "Evaluation show returned invalid JSON without diagnostic output."
               throw "The live evaluation show command did not return valid JSON."
             }
 
@@ -393,16 +488,23 @@ jobs:
 
             & azd ai eval run output export $runId `
               --eval ci-f1-quality `
+              --format json `
               --output-file $rawExport `
               --no-prompt `
               *> $exportOutput
             if ($LASTEXITCODE -ne 0) {
+              Write-SanitizedDiagnostic `
+                -Paths @($exportOutput) `
+                -Fallback "Evaluation export failed without diagnostic output."
               throw "Failed to export the live evaluation per-sample results."
             }
 
             try {
               $export = Get-Content -LiteralPath $rawExport -Raw | ConvertFrom-Json
             } catch {
+              Write-SanitizedDiagnostic `
+                -Paths @($exportOutput) `
+                -Fallback "Evaluation export returned invalid JSON without diagnostic output."
               throw "The live evaluation export was not valid JSON."
             }
 

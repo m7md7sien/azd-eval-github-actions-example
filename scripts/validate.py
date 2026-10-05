@@ -164,9 +164,11 @@ def validate_live_workflow() -> None:
 
     assert_equal(
         set(workflow.get("on", {}).keys()),
-        {"workflow_dispatch"},
-        "Live workflow must remain default-off",
+        {"pull_request", "workflow_dispatch"},
+        "Live workflow triggers changed",
     )
+    if "pull_request_target" in workflow.get("on", {}):
+        fail("Live workflow must never use pull_request_target.")
     assert_equal(
         workflow.get("permissions"),
         {"contents": "read", "id-token": "write"},
@@ -174,6 +176,17 @@ def validate_live_workflow() -> None:
     )
 
     job = workflow.get("jobs", {}).get("live-evaluation", {})
+    condition = re.sub(r"\s+", " ", job.get("if", "")).strip()
+    assert_equal(
+        condition,
+        (
+            "github.event_name == 'workflow_dispatch' || "
+            "(github.event_name == 'pull_request' && "
+            "github.event.pull_request.head.repo.full_name == github.repository && "
+            "vars.AZD_EVAL_LIVE_PR_GATE == 'true')"
+        ),
+        "Live workflow pull request safety condition changed",
+    )
     assert_equal(
         job.get("environment"),
         {"name": "live-evaluation"},
@@ -195,7 +208,7 @@ def validate_live_workflow() -> None:
         "azd up --no-prompt",
         "azd ai eval run start --eval ci-f1-quality --no-prompt --no-wait -o json",
         "azd ai eval run show $runId --eval ci-f1-quality --wait --fail-on 'pass-rate=0.8' --output json --no-prompt",
-        "azd ai eval run output export $runId --eval ci-f1-quality --output-file $rawExport --no-prompt",
+        "azd ai eval run output export $runId --eval ci-f1-quality --format json --output-file $rawExport --no-prompt",
     ]
     positions = []
     for command in commands:
@@ -222,10 +235,24 @@ def validate_live_workflow() -> None:
         "Compare-Object $expectedArtifactFiles $artifactFiles",
         "Remove-Item -LiteralPath $rawPath",
         "$forbiddenValues",
+        "Protect-LiveDiagnostic",
+        "Write-SanitizedDiagnostic",
+        "[REDACTED_GUID]",
+        "[REDACTED_JWT]",
     ]
     for guard in required_guards:
         if guard not in script:
             fail(f"Live workflow is missing required validation or sanitization: {guard}")
+
+    diagnostic_calls = [
+        "Write-SanitizedDiagnostic -Paths @($deployOutput)",
+        "Write-SanitizedDiagnostic -Paths @($startError, $startOutput)",
+        "Write-SanitizedDiagnostic -Paths @($showError, $showOutput)",
+        "Write-SanitizedDiagnostic -Paths @($exportOutput)",
+    ]
+    for call in diagnostic_calls:
+        if call not in script:
+            fail(f"Live workflow does not emit captured failure diagnostics: {call}")
 
     upload_steps = [
         step
