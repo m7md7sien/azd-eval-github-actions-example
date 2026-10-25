@@ -270,12 +270,16 @@ jobs:
         env:
           AZD_CONFIG_DIR: ${{ runner.temp }}/azd-config
           AZURE_AI_PROJECT_ENDPOINT: ${{ secrets.AZURE_AI_PROJECT_ENDPOINT }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
 
           if ([string]::IsNullOrWhiteSpace($env:AZURE_AI_PROJECT_ENDPOINT)) {
             throw "The live-evaluation environment secret AZURE_AI_PROJECT_ENDPOINT is required."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:AZURE_RESOURCE_GROUP)) {
+            throw "The live-evaluation environment variable AZURE_RESOURCE_GROUP is required."
           }
 
           function Protect-LiveDiagnostic {

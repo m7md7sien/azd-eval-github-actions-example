@@ -59,16 +59,19 @@ emit only sanitized captured diagnostics, including the `--fail-on` quality
 gate message, with endpoint, identity, token, JWT, GUID, and URL-query values
 redacted.
 
-Configure the `live-evaluation` GitHub environment with these environment
-secrets for manual runs and any opted-in same-repository pull request gate:
+Configure the repository variable `AZURE_RESOURCE_GROUP`, then configure the
+`live-evaluation` GitHub environment with these environment secrets:
 
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID`
 - `AZURE_AI_PROJECT_ENDPOINT`
 
 The federated identity needs the **Foundry User** role at the Foundry project
-scope. The workflow uses no client secret and the `builtin.f1_score` evaluator
-requires no model deployment.
+scope and permission to create ARM deployments
+(`Microsoft.Resources/deployments/*`) scoped to the configured resource group.
+The inert Bicep marker creates only deployment metadata, not workload
+resources. The workflow uses no client secret and the `builtin.f1_score`
+evaluator requires no model deployment.
 
 The earlier local live lifecycle was validated against a disposable Foundry
 project with 2 passed, 0 failed, and 0 errored. That evidence predates this
@@ -93,10 +96,10 @@ python -m pip install -r requirements-dev.txt
 python scripts/validate.py
 ```
 
-The validator parses both workflow files and checks the infrastructure-free azd
-service reference, evaluation schema, deterministic fixture, Scenario 5 command
-order and flags, explicit result assertions, artifact allowlist, and raw-output
-cleanup.
+The validator parses both workflow files and checks the azd service reference,
+exact inert Bicep marker, evaluation schema, deterministic fixture, Scenario 5
+command order and flags, explicit result assertions, artifact allowlist, and
+raw-output cleanup.
 
 ## Immutable pins
 

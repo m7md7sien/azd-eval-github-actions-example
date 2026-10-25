@@ -21,8 +21,24 @@ ROOT = Path(__file__).resolve().parents[1]
 OFFLINE_WORKFLOW = ROOT / ".github" / "workflows" / "azd-eval.yml"
 LIVE_WORKFLOW = ROOT / ".github" / "workflows" / "live-evaluation.yml"
 AZURE_CONFIG = ROOT / "azure.yaml"
+INFRA_MAIN = ROOT / "infra" / "main.bicep"
 EVAL_CONFIG = ROOT / "live" / "azure.eval.yaml"
 FIXTURE = ROOT / "live" / "data" / "golden.jsonl"
+
+EXPECTED_RECONCILIATION_MARKER = """targetScope = 'resourceGroup'
+
+resource reconciliationMarker 'Microsoft.Resources/deployments@2022-09-01' = {
+  name: 'azd-eval-hero-reconciliation'
+  properties: {
+    mode: 'Incremental'
+    template: {
+      '$schema': 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
+      contentVersion: '1.0.0.0'
+      resources: []
+    }
+  }
+}
+"""
 
 EXPECTED_ROWS = [
     {
@@ -120,6 +136,14 @@ def validate_project_config() -> None:
         "Root azure.yaml live evaluation service changed",
     )
 
+    if not INFRA_MAIN.is_file():
+        fail("infra/main.bicep reconciliation marker is missing.")
+    assert_equal(
+        INFRA_MAIN.read_text(encoding="utf-8"),
+        EXPECTED_RECONCILIATION_MARKER,
+        "Infrastructure reconciliation marker changed",
+    )
+
     eval_config, _ = load_yaml(EVAL_CONFIG)
     assert_equal(
         eval_config.get("datasets"),
@@ -211,7 +235,17 @@ def validate_live_workflow() -> None:
     ]
     if len(hero_steps) != 1:
         fail("Live workflow must contain exactly one Scenario 5 lifecycle step.")
-    script = normalize_powershell(hero_steps[0].get("run", ""))
+    hero_step = hero_steps[0]
+    assert_equal(
+        hero_step.get("env"),
+        {
+            "AZD_CONFIG_DIR": "${{ runner.temp }}/azd-config",
+            "AZURE_AI_PROJECT_ENDPOINT": "${{ secrets.AZURE_AI_PROJECT_ENDPOINT }}",
+            "AZURE_RESOURCE_GROUP": "${{ vars.AZURE_RESOURCE_GROUP }}",
+        },
+        "Live workflow lifecycle environment changed",
+    )
+    script = normalize_powershell(hero_step.get("run", ""))
 
     commands = [
         "azd up --no-prompt",
@@ -246,6 +280,7 @@ def validate_live_workflow() -> None:
         "$forbiddenValues",
         "Protect-LiveDiagnostic",
         "Write-SanitizedDiagnostic",
+        "The live-evaluation environment variable AZURE_RESOURCE_GROUP is required.",
         "[REDACTED_GUID]",
         "[REDACTED_JWT]",
     ]
@@ -282,7 +317,10 @@ def main() -> int:
     validate_offline_workflow()
     validate_project_config()
     validate_live_workflow()
-    print("Validated workflow YAML, azd/evaluation configuration, fixture, and Scenario 5 lifecycle.")
+    print(
+        "Validated workflow YAML, inert Bicep marker, azd/evaluation configuration, "
+        "fixture, and Scenario 5 lifecycle."
+    )
     return 0
 
 
